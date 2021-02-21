@@ -1,172 +1,166 @@
-import importlib
+import logging
+from collections import OrderedDict
+
 import torch
-from collections import Counter
-from copy import deepcopy
-from os import path as osp
-from torch import distributed as dist
-from tqdm import tqdm
+import torch.nn as nn
+from torch.nn.parallel import DataParallel, DistributedDataParallel
+import models.networks as networks
+import models.lr_scheduler as lr_scheduler
+from .base_model import BaseModel
+from models.loss import CharbonnierLoss
 
-from basicsr.models.sr_model import SRModel
-from basicsr.utils import get_root_logger, imwrite, tensor2img
-from basicsr.utils.dist_util import get_dist_info
-
-metric_module = importlib.import_module('basicsr.metrics')
+logger = logging.getLogger('base')
 
 
-class VideoBaseModel(SRModel):
-    """Base video SR model."""
+class VideoBaseModel(BaseModel):
+    def __init__(self, opt):
+        super(VideoBaseModel, self).__init__(opt)
 
-    def dist_validation(self, dataloader, current_iter, tb_logger, save_img):
-        dataset = dataloader.dataset
-        dataset_name = dataset.opt['name']
-        with_metrics = self.opt['val']['metrics'] is not None
-        # initialize self.metric_results
-        # It is a dict: {
-        #    'folder1': tensor (num_frame x len(metrics)),
-        #    'folder2': tensor (num_frame x len(metrics))
-        # }
-        if with_metrics and not hasattr(self, 'metric_results'):
-            self.metric_results = {}
-            num_frame_each_folder = Counter(dataset.data_info['folder'])
-            for folder, num_frame in num_frame_each_folder.items():
-                self.metric_results[folder] = torch.zeros(
-                    num_frame,
-                    len(self.opt['val']['metrics']),
-                    dtype=torch.float32,
-                    device='cuda')
-        rank, world_size = get_dist_info()
-        if with_metrics:
-            for _, tensor in self.metric_results.items():
-                tensor.zero_()
-        # record all frames (border and center frames)
-        if rank == 0:
-            pbar = tqdm(total=len(dataset), unit='frame')
-        for idx in range(rank, len(dataset), world_size):
-            val_data = dataset[idx]
-            val_data['lq'].unsqueeze_(0)
-            val_data['gt'].unsqueeze_(0)
-            folder = val_data['folder']
-            frame_idx, max_idx = val_data['idx'].split('/')
-            lq_path = val_data['lq_path']
+        if opt['dist']:
+            self.rank = torch.distributed.get_rank()
+        else:
+            self.rank = -1  # non dist training
+        train_opt = opt['train']
 
-            self.feed_data(val_data)
-            self.test()
-            visuals = self.get_current_visuals()
-            result_img = tensor2img([visuals['result']])
-            if 'gt' in visuals:
-                gt_img = tensor2img([visuals['gt']])
-                del self.gt
+        # define network and load pretrained models
+        self.netG = networks.define_G(opt).to(self.device)
+        if opt['dist']:
+            self.netG = DistributedDataParallel(self.netG, device_ids=[torch.cuda.current_device()])
+        else:
+            self.netG = DataParallel(self.netG)
+        # print network
+        self.print_network()
+        self.load()
 
-            # tentative for out of GPU memory
-            del self.lq
-            del self.output
-            torch.cuda.empty_cache()
+        if self.is_train:
+            self.netG.train()
 
-            if save_img:
-                if self.opt['is_train']:
-                    raise NotImplementedError(
-                        'saving image is not supported during training.')
-                else:
-                    if 'vimeo' in dataset_name.lower():  # vimeo90k dataset
-                        split_result = lq_path.split('/')
-                        img_name = (f'{split_result[-3]}_{split_result[-2]}_'
-                                    f'{split_result[-1].split(".")[0]}')
-                    else:  # other datasets, e.g., REDS, Vid4
-                        img_name = osp.splitext(osp.basename(lq_path))[0]
-
-                    if self.opt['val']['suffix']:
-                        save_img_path = osp.join(
-                            self.opt['path']['visualization'], dataset_name,
-                            folder,
-                            f'{img_name}_{self.opt["val"]["suffix"]}.png')
-                    else:
-                        save_img_path = osp.join(
-                            self.opt['path']['visualization'], dataset_name,
-                            folder, f'{img_name}_{self.opt["name"]}.png')
-                imwrite(result_img, save_img_path)
-
-            if with_metrics:
-                # calculate metrics
-                opt_metric = deepcopy(self.opt['val']['metrics'])
-                for metric_idx, opt_ in enumerate(opt_metric.values()):
-                    metric_type = opt_.pop('type')
-                    result = getattr(metric_module,
-                                     metric_type)(result_img, gt_img, **opt_)
-                    self.metric_results[folder][int(frame_idx),
-                                                metric_idx] += result
-
-            # progress bar
-            if rank == 0:
-                for _ in range(world_size):
-                    pbar.update(1)
-                    pbar.set_description(
-                        f'Test {folder}:'
-                        f'{int(frame_idx) + world_size}/{max_idx}')
-        if rank == 0:
-            pbar.close()
-
-        if with_metrics:
-            if self.opt['dist']:
-                # collect data among GPUs
-                for _, tensor in self.metric_results.items():
-                    dist.reduce(tensor, 0)
-                dist.barrier()
+            #### loss
+            loss_type = train_opt['pixel_criterion']
+            if loss_type == 'l1':
+                self.cri_pix = nn.L1Loss(reduction='sum').to(self.device)
+            elif loss_type == 'l2':
+                self.cri_pix = nn.MSELoss(reduction='sum').to(self.device)
+            elif loss_type == 'cb':
+                self.cri_pix = CharbonnierLoss().to(self.device)
             else:
-                pass  # assume use one gpu in non-dist testing
+                raise NotImplementedError('Loss type [{:s}] is not recognized.'.format(loss_type))
+            self.l_pix_w = train_opt['pixel_weight']
 
-            if rank == 0:
-                self._log_validation_metric_values(current_iter, dataset_name,
-                                                   tb_logger)
+            #### optimizers
+            wd_G = train_opt['weight_decay_G'] if train_opt['weight_decay_G'] else 0
+            if train_opt['ft_tsa_only']:
+                normal_params = []
+                tsa_fusion_params = []
+                for k, v in self.netG.named_parameters():
+                    if v.requires_grad:
+                        if 'tsa_fusion' in k:
+                            tsa_fusion_params.append(v)
+                        else:
+                            normal_params.append(v)
+                    else:
+                        if self.rank <= 0:
+                            logger.warning('Params [{:s}] will not optimize.'.format(k))
+                optim_params = [
+                    {  # add normal params first
+                        'params': normal_params,
+                        'lr': train_opt['lr_G']
+                    },
+                    {
+                        'params': tsa_fusion_params,
+                        'lr': train_opt['lr_G']
+                    },
+                ]
+            else:
+                optim_params = []
+                for k, v in self.netG.named_parameters():
+                    if v.requires_grad:
+                        optim_params.append(v)
+                    else:
+                        if self.rank <= 0:
+                            logger.warning('Params [{:s}] will not optimize.'.format(k))
 
-    def nondist_validation(self, dataloader, current_iter, tb_logger,
-                           save_img):
-        logger = get_root_logger()
-        logger.warning(
-            'nondist_validation is not implemented. Run dist_validation.')
-        self.dist_validation(dataloader, current_iter, tb_logger, save_img)
+            self.optimizer_G = torch.optim.Adam(optim_params, lr=train_opt['lr_G'],
+                                                weight_decay=wd_G,
+                                                betas=(train_opt['beta1'], train_opt['beta2']))
+            self.optimizers.append(self.optimizer_G)
 
-    def _log_validation_metric_values(self, current_iter, dataset_name,
-                                      tb_logger):
-        # average all frames for each sub-folder
-        # metric_results_avg is a dict:{
-        #    'folder1': tensor (len(metrics)),
-        #    'folder2': tensor (len(metrics))
-        # }
-        metric_results_avg = {
-            folder: torch.mean(tensor, dim=0).cpu()
-            for (folder, tensor) in self.metric_results.items()
-        }
-        # total_avg_results is a dict: {
-        #    'metric1': float,
-        #    'metric2': float
-        # }
-        total_avg_results = {
-            metric: 0
-            for metric in self.opt['val']['metrics'].keys()
-        }
-        for folder, tensor in metric_results_avg.items():
-            for idx, metric in enumerate(total_avg_results.keys()):
-                total_avg_results[metric] += metric_results_avg[folder][
-                    idx].item()
-        # average among folders
-        for metric in total_avg_results.keys():
-            total_avg_results[metric] /= len(metric_results_avg)
+            #### schedulers
+            if train_opt['lr_scheme'] == 'MultiStepLR':
+                for optimizer in self.optimizers:
+                    self.schedulers.append(
+                        lr_scheduler.MultiStepLR_Restart(optimizer, train_opt['lr_steps'],
+                                                         restarts=train_opt['restarts'],
+                                                         weights=train_opt['restart_weights'],
+                                                         gamma=train_opt['lr_gamma'],
+                                                         clear_state=train_opt['clear_state']))
+            elif train_opt['lr_scheme'] == 'CosineAnnealingLR_Restart':
+                for optimizer in self.optimizers:
+                    self.schedulers.append(
+                        lr_scheduler.CosineAnnealingLR_Restart(
+                            optimizer, train_opt['T_period'], eta_min=train_opt['eta_min'],
+                            restarts=train_opt['restarts'], weights=train_opt['restart_weights']))
+            else:
+                raise NotImplementedError()
 
-        log_str = f'Validation {dataset_name}\n'
-        for metric_idx, (metric,
-                         value) in enumerate(total_avg_results.items()):
-            log_str += f'\t # {metric}: {value:.4f}'
-            for folder, tensor in metric_results_avg.items():
-                log_str += f'\t # {folder}: {tensor[metric_idx].item():.4f}'
-            log_str += '\n'
+            self.log_dict = OrderedDict()
 
-        logger = get_root_logger()
-        logger.info(log_str)
-        if tb_logger:
-            for metric_idx, (metric,
-                             value) in enumerate(total_avg_results.items()):
-                tb_logger.add_scalar(f'metrics/{metric}', value, current_iter)
-                for folder, tensor in metric_results_avg.items():
-                    tb_logger.add_scalar(f'metrics/{metric}/{folder}',
-                                         tensor[metric_idx].item(),
-                                         current_iter)
+    def feed_data(self, data, need_GT=True):
+        self.var_L = data['LQs'].to(self.device)
+        if need_GT:
+            self.real_H = data['GT'].to(self.device)
+
+    def set_params_lr_zero(self):
+        # fix normal module
+        self.optimizers[0].param_groups[0]['lr'] = 0
+
+    def optimize_parameters(self, step):
+        if self.opt['train']['ft_tsa_only'] and step < self.opt['train']['ft_tsa_only']:
+            self.set_params_lr_zero()
+
+        self.optimizer_G.zero_grad()
+        self.fake_H = self.netG(self.var_L)
+
+        l_pix = self.l_pix_w * self.cri_pix(self.fake_H, self.real_H)
+        l_pix.backward()
+        self.optimizer_G.step()
+
+        # set log
+        self.log_dict['l_pix'] = l_pix.item()
+
+    def test(self):
+        self.netG.eval()
+        with torch.no_grad():
+            self.fake_H = self.netG(self.var_L)
+        self.netG.train()
+
+    def get_current_log(self):
+        return self.log_dict
+
+    def get_current_visuals(self, need_GT=True):
+        out_dict = OrderedDict()
+        out_dict['LQ'] = self.var_L.detach()[0].float().cpu()
+        out_dict['rlt'] = self.fake_H.detach()[0].float().cpu()
+        if need_GT:
+            out_dict['GT'] = self.real_H.detach()[0].float().cpu()
+        return out_dict
+
+    def print_network(self):
+        s, n = self.get_network_description(self.netG)
+        if isinstance(self.netG, nn.DataParallel):
+            net_struc_str = '{} - {}'.format(self.netG.__class__.__name__,
+                                             self.netG.module.__class__.__name__)
+        else:
+            net_struc_str = '{}'.format(self.netG.__class__.__name__)
+        if self.rank <= 0:
+            logger.info('Network G structure: {}, with parameters: {:,d}'.format(net_struc_str, n))
+            logger.info(s)
+
+    def load(self):
+        load_path_G = self.opt['path']['pretrain_model_G']
+        if load_path_G is not None:
+            logger.info('Loading model for G [{:s}] ...'.format(load_path_G))
+            self.load_network(load_path_G, self.netG, self.opt['path']['strict_load'])
+
+    def save(self, iter_label):
+        self.save_network(self.netG, 'G', iter_label)

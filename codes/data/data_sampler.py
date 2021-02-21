@@ -1,30 +1,46 @@
+"""
+Modified from torch.utils.data.distributed.DistributedSampler
+Support enlarging the dataset for *iteration-oriented* training, for saving time when restart the
+dataloader after each epoch
+"""
 import math
 import torch
 from torch.utils.data.sampler import Sampler
+import torch.distributed as dist
 
 
-class EnlargedSampler(Sampler):
+class DistIterSampler(Sampler):
     """Sampler that restricts data loading to a subset of the dataset.
 
-    Modified from torch.utils.data.distributed.DistributedSampler
-    Support enlarging the dataset for iteration-based training, for saving
-    time when restart the dataloader after each epoch
+    It is especially useful in conjunction with
+    :class:`torch.nn.parallel.DistributedDataParallel`. In such case, each
+    process can pass a DistributedSampler instance as a DataLoader sampler,
+    and load a subset of the original dataset that is exclusive to it.
 
-    Args:
-        dataset (torch.utils.data.Dataset): Dataset used for sampling.
-        num_replicas (int | None): Number of processes participating in
-            the training. It is usually the world_size.
-        rank (int | None): Rank of the current process within num_replicas.
-        ratio (int): Enlarging ratio. Default: 1.
+    .. note::
+        Dataset is assumed to be of constant size.
+
+    Arguments:
+        dataset: Dataset used for sampling.
+        num_replicas (optional): Number of processes participating in
+            distributed training.
+        rank (optional): Rank of the current process within num_replicas.
     """
 
-    def __init__(self, dataset, num_replicas, rank, ratio=1):
+    def __init__(self, dataset, num_replicas=None, rank=None, ratio=100):
+        if num_replicas is None:
+            if not dist.is_available():
+                raise RuntimeError("Requires distributed package to be available")
+            num_replicas = dist.get_world_size()
+        if rank is None:
+            if not dist.is_available():
+                raise RuntimeError("Requires distributed package to be available")
+            rank = dist.get_rank()
         self.dataset = dataset
         self.num_replicas = num_replicas
         self.rank = rank
         self.epoch = 0
-        self.num_samples = math.ceil(
-            len(self.dataset) * ratio / self.num_replicas)
+        self.num_samples = int(math.ceil(len(self.dataset) * ratio / self.num_replicas))
         self.total_size = self.num_samples * self.num_replicas
 
     def __iter__(self):
@@ -33,8 +49,8 @@ class EnlargedSampler(Sampler):
         g.manual_seed(self.epoch)
         indices = torch.randperm(self.total_size, generator=g).tolist()
 
-        dataset_size = len(self.dataset)
-        indices = [v % dataset_size for v in indices]
+        dsize = len(self.dataset)
+        indices = [v % dsize for v in indices]
 
         # subsample
         indices = indices[self.rank:self.total_size:self.num_replicas]
