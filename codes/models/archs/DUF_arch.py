@@ -1,368 +1,359 @@
-'''Network architecture for DUF:
-Deep Video Super-Resolution Network Using Dynamic Upsampling Filters
-Without Explicit Motion Compensation (CVPR18)
-https://github.com/yhjo09/VSR-DUF
-
-For all the models below, [adapt_official] is only necessary when
-loading the weights converted from the official TensorFlow weights.
-Please set it to [False] if you are training the model from scratch.
-'''
-
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
+from torch import nn as nn
+from torch.nn import functional as F
 
 
-def adapt_official(Rx, scale=4):
-    '''Adapt the weights translated from the official tensorflow weights
-    Not necessary if you are training from scratch'''
-    x = Rx.clone()
-    x1 = x[:, ::3, :, :]
-    x2 = x[:, 1::3, :, :]
-    x3 = x[:, 2::3, :, :]
+class DenseBlocksTemporalReduce(nn.Module):
+    """A concatenation of 3 dense blocks with reduction in temporal dimension.
 
-    Rx[:, :scale**2, :, :] = x1
-    Rx[:, scale**2:2 * (scale**2), :, :] = x2
-    Rx[:, 2 * (scale**2):, :, :] = x3
+    Note that the output temporal dimension is 6 fewer the input temporal
+    dimension, since there are 3 blocks.
 
-    return Rx
+    Args:
+        num_feat (int): Number of channels in the blocks. Default: 64.
+        num_grow_ch (int): Growing factor of the dense blocks. Default: 32
+        adapt_official_weights (bool): Whether to adapt the weights
+            translated from the official implementation. Set to false if you
+            want to train from scratch. Default: False.
+    """
 
+    def __init__(self,
+                 num_feat=64,
+                 num_grow_ch=32,
+                 adapt_official_weights=False):
+        super(DenseBlocksTemporalReduce, self).__init__()
+        if adapt_official_weights:
+            eps = 1e-3
+            momentum = 1e-3
+        else:  # pytorch default values
+            eps = 1e-05
+            momentum = 0.1
 
-class DenseBlock(nn.Module):
-    '''Dense block
-    for the second denseblock, t_reduced = True'''
+        self.temporal_reduce1 = nn.Sequential(
+            nn.BatchNorm3d(num_feat, eps=eps, momentum=momentum),
+            nn.ReLU(inplace=True),
+            nn.Conv3d(
+                num_feat,
+                num_feat, (1, 1, 1),
+                stride=(1, 1, 1),
+                padding=(0, 0, 0),
+                bias=True),
+            nn.BatchNorm3d(num_feat, eps=eps, momentum=momentum),
+            nn.ReLU(inplace=True),
+            nn.Conv3d(
+                num_feat,
+                num_grow_ch, (3, 3, 3),
+                stride=(1, 1, 1),
+                padding=(0, 1, 1),
+                bias=True))
 
-    def __init__(self, nf=64, ng=32, t_reduce=False):
-        super(DenseBlock, self).__init__()
-        self.t_reduce = t_reduce
-        if self.t_reduce:
-            pad = (0, 1, 1)
-        else:
-            pad = (1, 1, 1)
-        self.bn3d_1 = nn.BatchNorm3d(nf, eps=1e-3, momentum=1e-3)
-        self.conv3d_1 = nn.Conv3d(nf, nf, (1, 1, 1), stride=(1, 1, 1), padding=(0, 0, 0), bias=True)
-        self.bn3d_2 = nn.BatchNorm3d(nf, eps=1e-3, momentum=1e-3)
-        self.conv3d_2 = nn.Conv3d(nf, ng, (3, 3, 3), stride=(1, 1, 1), padding=pad, bias=True)
-        self.bn3d_3 = nn.BatchNorm3d(nf + ng, eps=1e-3, momentum=1e-3)
-        self.conv3d_3 = nn.Conv3d(nf + ng, nf + ng, (1, 1, 1), stride=(1, 1, 1), padding=(0, 0, 0),
-                                  bias=True)
-        self.bn3d_4 = nn.BatchNorm3d(nf + ng, eps=1e-3, momentum=1e-3)
-        self.conv3d_4 = nn.Conv3d(nf + ng, ng, (3, 3, 3), stride=(1, 1, 1), padding=pad, bias=True)
-        self.bn3d_5 = nn.BatchNorm3d(nf + 2 * ng, eps=1e-3, momentum=1e-3)
-        self.conv3d_5 = nn.Conv3d(nf + 2 * ng, nf + 2 * ng, (1, 1, 1), stride=(1, 1, 1),
-                                  padding=(0, 0, 0), bias=True)
-        self.bn3d_6 = nn.BatchNorm3d(nf + 2 * ng, eps=1e-3, momentum=1e-3)
-        self.conv3d_6 = nn.Conv3d(nf + 2 * ng, ng, (3, 3, 3), stride=(1, 1, 1), padding=pad,
-                                  bias=True)
+        self.temporal_reduce2 = nn.Sequential(
+            nn.BatchNorm3d(num_feat + num_grow_ch, eps=eps, momentum=momentum),
+            nn.ReLU(inplace=True),
+            nn.Conv3d(
+                num_feat + num_grow_ch,
+                num_feat + num_grow_ch, (1, 1, 1),
+                stride=(1, 1, 1),
+                padding=(0, 0, 0),
+                bias=True),
+            nn.BatchNorm3d(num_feat + num_grow_ch, eps=eps, momentum=momentum),
+            nn.ReLU(inplace=True),
+            nn.Conv3d(
+                num_feat + num_grow_ch,
+                num_grow_ch, (3, 3, 3),
+                stride=(1, 1, 1),
+                padding=(0, 1, 1),
+                bias=True))
+
+        self.temporal_reduce3 = nn.Sequential(
+            nn.BatchNorm3d(
+                num_feat + 2 * num_grow_ch, eps=eps, momentum=momentum),
+            nn.ReLU(inplace=True),
+            nn.Conv3d(
+                num_feat + 2 * num_grow_ch,
+                num_feat + 2 * num_grow_ch, (1, 1, 1),
+                stride=(1, 1, 1),
+                padding=(0, 0, 0),
+                bias=True),
+            nn.BatchNorm3d(
+                num_feat + 2 * num_grow_ch, eps=eps, momentum=momentum),
+            nn.ReLU(inplace=True),
+            nn.Conv3d(
+                num_feat + 2 * num_grow_ch,
+                num_grow_ch, (3, 3, 3),
+                stride=(1, 1, 1),
+                padding=(0, 1, 1),
+                bias=True))
 
     def forward(self, x):
-        '''x: [B, C, T, H, W]
-        C: nf -> nf + 3 * ng
-        T: 1) 7 -> 7 (t_reduce=False);
-           2) 7 -> 7 - 2 * 3 = 1 (t_reduce=True)'''
-        x1 = self.conv3d_1(F.relu(self.bn3d_1(x), inplace=True))
-        x1 = self.conv3d_2(F.relu(self.bn3d_2(x1), inplace=True))
-        if self.t_reduce:
-            x1 = torch.cat((x[:, :, 1:-1, :, :], x1), 1)
-        else:
-            x1 = torch.cat((x, x1), 1)
+        """
+        Args:
+            x (Tensor): Input tensor with shape (b, num_feat, t, h, w).
 
-        x2 = self.conv3d_3(F.relu(self.bn3d_3(x1), inplace=True))
-        x2 = self.conv3d_4(F.relu(self.bn3d_4(x2), inplace=True))
-        if self.t_reduce:
-            x2 = torch.cat((x1[:, :, 1:-1, :, :], x2), 1)
-        else:
-            x2 = torch.cat((x1, x2), 1)
+        Returns:
+            Tensor: Output with shape (b, num_feat + num_grow_ch * 3, 1, h, w).
+        """
+        x1 = self.temporal_reduce1(x)
+        x1 = torch.cat((x[:, :, 1:-1, :, :], x1), 1)
 
-        x3 = self.conv3d_5(F.relu(self.bn3d_5(x2), inplace=True))
-        x3 = self.conv3d_6(F.relu(self.bn3d_6(x3), inplace=True))
-        if self.t_reduce:
-            x3 = torch.cat((x2[:, :, 1:-1, :, :], x3), 1)
-        else:
-            x3 = torch.cat((x2, x3), 1)
+        x2 = self.temporal_reduce2(x1)
+        x2 = torch.cat((x1[:, :, 1:-1, :, :], x2), 1)
+
+        x3 = self.temporal_reduce3(x2)
+        x3 = torch.cat((x2[:, :, 1:-1, :, :], x3), 1)
+
         return x3
 
 
-class DynamicUpsamplingFilter_3C(nn.Module):
-    '''dynamic upsampling filter with 3 channels applying the same filters
-    filter_size: filter size of the generated filters, shape (C, kH, kW)'''
+class DenseBlocks(nn.Module):
+    """ A concatenation of N dense blocks.
 
-    def __init__(self, filter_size=(1, 5, 5)):
-        super(DynamicUpsamplingFilter_3C, self).__init__()
-        # generate a local expansion filter, used similar to im2col
-        nF = np.prod(filter_size)
-        expand_filter_np = np.reshape(np.eye(nF, nF),
-                                      (nF, filter_size[0], filter_size[1], filter_size[2]))
-        expand_filter = torch.from_numpy(expand_filter_np).float()
-        self.expand_filter = torch.cat((expand_filter, expand_filter, expand_filter),
-                                       0)  # [75, 1, 5, 5]
+    Args:
+        num_feat (int): Number of channels in the blocks. Default: 64.
+        num_grow_ch (int): Growing factor of the dense blocks. Default: 32.
+        num_block (int): Number of dense blocks. The values are:
+            DUF-S (16 layers): 3
+            DUF-M (18 layers): 9
+            DUF-L (52 layers): 21
+        adapt_official_weights (bool): Whether to adapt the weights
+            translated from the official implementation. Set to false if you
+            want to train from scratch. Default: False.
+    """
+
+    def __init__(self,
+                 num_block,
+                 num_feat=64,
+                 num_grow_ch=16,
+                 adapt_official_weights=False):
+        super(DenseBlocks, self).__init__()
+        if adapt_official_weights:
+            eps = 1e-3
+            momentum = 1e-3
+        else:  # pytorch default values
+            eps = 1e-05
+            momentum = 0.1
+
+        self.dense_blocks = nn.ModuleList()
+        for i in range(0, num_block):
+            self.dense_blocks.append(
+                nn.Sequential(
+                    nn.BatchNorm3d(
+                        num_feat + i * num_grow_ch, eps=eps,
+                        momentum=momentum), nn.ReLU(inplace=True),
+                    nn.Conv3d(
+                        num_feat + i * num_grow_ch,
+                        num_feat + i * num_grow_ch, (1, 1, 1),
+                        stride=(1, 1, 1),
+                        padding=(0, 0, 0),
+                        bias=True),
+                    nn.BatchNorm3d(
+                        num_feat + i * num_grow_ch, eps=eps,
+                        momentum=momentum), nn.ReLU(inplace=True),
+                    nn.Conv3d(
+                        num_feat + i * num_grow_ch,
+                        num_grow_ch, (3, 3, 3),
+                        stride=(1, 1, 1),
+                        padding=(1, 1, 1),
+                        bias=True)))
+
+    def forward(self, x):
+        """
+        Args:
+            x (Tensor): Input tensor with shape (b, num_feat, t, h, w).
+
+        Returns:
+            Tensor: Output with shape
+                (b, num_feat + num_block * num_grow_ch, t, h, w).
+        """
+        for i in range(0, len(self.dense_blocks)):
+            y = self.dense_blocks[i](x)
+            x = torch.cat((x, y), 1)
+        return x
+
+
+class DynamicUpsamplingFilter(nn.Module):
+    """Dynamic upsampling filter used in DUF.
+
+    Ref: https://github.com/yhjo09/VSR-DUF.
+    It only supports input with 3 channels. And it applies the same filters
+    to 3 channels.
+
+    Args:
+        filter_size (tuple): Filter size of generated filters.
+            The shape is (kh, kw). Default: (5, 5).
+    """
+
+    def __init__(self, filter_size=(5, 5)):
+        super(DynamicUpsamplingFilter, self).__init__()
+        if not isinstance(filter_size, tuple):
+            raise TypeError('The type of filter_size must be tuple, '
+                            f'but got type{filter_size}')
+        if len(filter_size) != 2:
+            raise ValueError('The length of filter size must be 2, '
+                             f'but got {len(filter_size)}.')
+        # generate a local expansion filter, similar to im2col
+        self.filter_size = filter_size
+        filter_prod = np.prod(filter_size)
+        expansion_filter = torch.eye(int(filter_prod)).view(
+            filter_prod, 1, *filter_size)  # (kh*kw, 1, kh, kw)
+        self.expansion_filter = expansion_filter.repeat(
+            3, 1, 1, 1)  # repeat for all the 3 channels
 
     def forward(self, x, filters):
-        '''x: input image, [B, 3, H, W]
-        filters: generate dynamic filters, [B, F, R, H, W], e.g., [B, 25, 16, H, W]
-            F: prod of filter kernel size, e.g., 5*5 = 25
-            R: used for upsampling, similar to pixel shuffle, e.g., 4*4 = 16 for x4
-        Return: filtered image, [B, 3*R, H, W]
-        '''
-        B, nF, R, H, W = filters.size()
-        # using group convolution
-        input_expand = F.conv2d(x, self.expand_filter.type_as(x), padding=2,
-                                groups=3)  # [B, 75, H, W] similar to im2col
-        input_expand = input_expand.view(B, 3, nF, H, W).permute(0, 3, 4, 1, 2)  # [B, H, W, 3, 25]
-        filters = filters.permute(0, 3, 4, 1, 2)  # [B, H, W, 25, 16]
-        out = torch.matmul(input_expand, filters)  # [B, H, W, 3, 16]
-        return out.permute(0, 3, 4, 1, 2).view(B, 3 * R, H, W)  # [B, 3*16, H, W]
+        """Forward function for DynamicUpsamplingFilter.
+
+        Args:
+            x (Tensor): Input image with 3 channels. The shape is (n, 3, h, w).
+            filters (Tensor): Generated dynamic filters.
+                The shape is (n, filter_prod, upsampling_square, h, w).
+                filter_prod: prod of filter kenrel size, e.g., 1*5*5=25.
+                upsampling_square: similar to pixel shuffle,
+                    upsampling_square = upsampling * upsampling
+                    e.g., for x 4 upsampling, upsampling_square= 4*4 = 16
+
+        Returns:
+            Tensor: Filtered image with shape (n, 3*upsampling_square, h, w)
+        """
+        n, filter_prod, upsampling_square, h, w = filters.size()
+        kh, kw = self.filter_size
+        expanded_input = F.conv2d(
+            x,
+            self.expansion_filter.to(x),
+            padding=(kh // 2, kw // 2),
+            groups=3)  # (n, 3*filter_prod, h, w)
+        expanded_input = expanded_input.view(n, 3, filter_prod, h, w).permute(
+            0, 3, 4, 1, 2)  # (n, h, w, 3, filter_prod)
+        filters = filters.permute(
+            0, 3, 4, 1, 2)  # (n, h, w, filter_prod, upsampling_square]
+        out = torch.matmul(expanded_input,
+                           filters)  # (n, h, w, 3, upsampling_square)
+        return out.permute(0, 3, 4, 1, 2).view(n, 3 * upsampling_square, h, w)
 
 
-class DUF_16L(nn.Module):
-    '''Official DUF structure with 16 layers'''
+class DUF(nn.Module):
+    """Network architecture for DUF
 
-    def __init__(self, scale=4, adapt_official=False):
-        super(DUF_16L, self).__init__()
-        self.conv3d_1 = nn.Conv3d(3, 64, (1, 3, 3), stride=(1, 1, 1), padding=(0, 1, 1), bias=True)
-        self.dense_block_1 = DenseBlock(64, 64 // 2, t_reduce=False)  # 64 + 32 * 3 = 160, T = 7
-        self.dense_block_2 = DenseBlock(160, 64 // 2, t_reduce=True)  # 160 + 32 * 3 = 256, T = 1
-        self.bn3d_2 = nn.BatchNorm3d(256, eps=1e-3, momentum=1e-3)
-        self.conv3d_2 = nn.Conv3d(256, 256, (1, 3, 3), stride=(1, 1, 1), padding=(0, 1, 1),
-                                  bias=True)
+    Paper: Jo et.al. Deep Video Super-Resolution Network Using Dynamic
+            Upsampling Filters Without Explicit Motion Compensation, CVPR, 2018
+    Code reference:
+        https://github.com/yhjo09/VSR-DUF
+    For all the models below, 'adapt_official_weights' is only necessary when
+    loading the weights converted from the official TensorFlow weights.
+    Please set it to False if you are training the model from scratch.
 
-        self.conv3d_r1 = nn.Conv3d(256, 256, (1, 1, 1), stride=(1, 1, 1), padding=(0, 0, 0),
-                                   bias=True)
-        self.conv3d_r2 = nn.Conv3d(256, 3 * (scale**2), (1, 1, 1), stride=(1, 1, 1),
-                                   padding=(0, 0, 0), bias=True)
+    There are three models with different model size: DUF16Layers, DUF28Layers,
+    and DUF52Layers. This class is the base class for these models.
 
-        self.conv3d_f1 = nn.Conv3d(256, 512, (1, 1, 1), stride=(1, 1, 1), padding=(0, 0, 0),
-                                   bias=True)
-        self.conv3d_f2 = nn.Conv3d(512, 1 * 5 * 5 * (scale**2), (1, 1, 1), stride=(1, 1, 1),
-                                   padding=(0, 0, 0), bias=True)
+    Args:
+        scale (int): The upsampling factor. Default: 4.
+        num_layer (int): The number of layers. Default: 52.
+        adapt_official_weights_weights (bool): Whether to adapt the weights
+            translated from the official implementation. Set to false if you
+            want to train from scratch. Default: False.
+    """
 
-        self.dynamic_filter = DynamicUpsamplingFilter_3C((1, 5, 5))
-
+    def __init__(self, scale=4, num_layer=52, adapt_official_weights=False):
+        super(DUF, self).__init__()
         self.scale = scale
-        self.adapt_official = adapt_official
+        if adapt_official_weights:
+            eps = 1e-3
+            momentum = 1e-3
+        else:  # pytorch default values
+            eps = 1e-05
+            momentum = 0.1
+
+        self.conv3d1 = nn.Conv3d(
+            3, 64, (1, 3, 3), stride=(1, 1, 1), padding=(0, 1, 1), bias=True)
+        self.dynamic_filter = DynamicUpsamplingFilter((5, 5))
+
+        if num_layer == 16:
+            num_block = 3
+            num_grow_ch = 32
+        elif num_layer == 28:
+            num_block = 9
+            num_grow_ch = 16
+        elif num_layer == 52:
+            num_block = 21
+            num_grow_ch = 16
+        else:
+            raise ValueError(
+                f'Only supported (16, 28, 52) layers, but got {num_layer}.')
+
+        self.dense_block1 = DenseBlocks(
+            num_block=num_block,
+            num_feat=64,
+            num_grow_ch=num_grow_ch,
+            adapt_official_weights=adapt_official_weights)  # T = 7
+        self.dense_block2 = DenseBlocksTemporalReduce(
+            64 + num_grow_ch * num_block,
+            num_grow_ch,
+            adapt_official_weights=adapt_official_weights)  # T = 1
+        channels = 64 + num_grow_ch * num_block + num_grow_ch * 3
+        self.bn3d2 = nn.BatchNorm3d(channels, eps=eps, momentum=momentum)
+        self.conv3d2 = nn.Conv3d(
+            channels,
+            256, (1, 3, 3),
+            stride=(1, 1, 1),
+            padding=(0, 1, 1),
+            bias=True)
+
+        self.conv3d_r1 = nn.Conv3d(
+            256,
+            256, (1, 1, 1),
+            stride=(1, 1, 1),
+            padding=(0, 0, 0),
+            bias=True)
+        self.conv3d_r2 = nn.Conv3d(
+            256,
+            3 * (scale**2), (1, 1, 1),
+            stride=(1, 1, 1),
+            padding=(0, 0, 0),
+            bias=True)
+
+        self.conv3d_f1 = nn.Conv3d(
+            256,
+            512, (1, 1, 1),
+            stride=(1, 1, 1),
+            padding=(0, 0, 0),
+            bias=True)
+        self.conv3d_f2 = nn.Conv3d(
+            512,
+            1 * 5 * 5 * (scale**2), (1, 1, 1),
+            stride=(1, 1, 1),
+            padding=(0, 0, 0),
+            bias=True)
 
     def forward(self, x):
-        '''
-        x: [B, T, C, H, W], T = 7. reshape to [B, C, T, H, W] for Conv3D
-        Generate filters and image residual:
-        Fx: [B, 25, 16, H, W] for DynamicUpsamplingFilter_3C
-        Rx: [B, 3*16, 1, H, W]
-        '''
-        B, T, C, H, W = x.size()
-        x = x.permute(0, 2, 1, 3, 4)  # [B, C, T, H, W] for Conv3D
-        x_center = x[:, :, T // 2, :, :]
+        """
+        Args:
+            x (Tensor): Input with shape (b, 7, c, h, w)
 
-        x = self.conv3d_1(x)
-        x = self.dense_block_1(x)
-        x = self.dense_block_2(x)  # reduce T to 1
-        x = F.relu(self.conv3d_2(F.relu(self.bn3d_2(x), inplace=True)), inplace=True)
+        Returns:
+            Tensor: Output with shape (b, 1, h * scale, w * scale)
+        """
+        num_batches, num_imgs, _, h, w = x.size()
 
-        # image residual
-        Rx = self.conv3d_r2(F.relu(self.conv3d_r1(x), inplace=True))  # [B, 3*16, 1, H, W]
+        x = x.permute(0, 2, 1, 3, 4)  # (b, c, 7, h, w) for Conv3D
+        x_center = x[:, :, num_imgs // 2, :, :]
+
+        x = self.conv3d1(x)
+        x = self.dense_block1(x)
+        x = self.dense_block2(x)
+        x = F.relu(self.bn3d2(x), inplace=True)
+        x = F.relu(self.conv3d2(x), inplace=True)
+
+        # residual image
+        res = self.conv3d_r2(F.relu(self.conv3d_r1(x), inplace=True))
 
         # filter
-        Fx = self.conv3d_f2(F.relu(self.conv3d_f1(x), inplace=True))  # [B, 25*16, 1, H, W]
-        Fx = F.softmax(Fx.view(B, 25, self.scale**2, H, W), dim=1)
-
-        # Adapt to official model weights
-        if self.adapt_official:
-            adapt_official(Rx, scale=self.scale)
+        filter_ = self.conv3d_f2(F.relu(self.conv3d_f1(x), inplace=True))
+        filter_ = F.softmax(
+            filter_.view(num_batches, 25, self.scale**2, h, w), dim=1)
 
         # dynamic filter
-        out = self.dynamic_filter(x_center, Fx)  # [B, 3*R, H, W]
-        out += Rx.squeeze_(2)
-        out = F.pixel_shuffle(out, self.scale)  # [B, 3, H, W]
+        out = self.dynamic_filter(x_center, filter_)
+        out += res.squeeze_(2)
+        out = F.pixel_shuffle(out, self.scale)
 
-        return out
-
-
-class DenseBlock_28L(nn.Module):
-    '''The first part of the dense blocks used in DUF_28L
-    Temporal dimension remains the same here'''
-
-    def __init__(self, nf=64, ng=16):
-        super(DenseBlock_28L, self).__init__()
-        pad = (1, 1, 1)
-
-        dense_block_l = []
-        for i in range(0, 9):
-            dense_block_l.append(nn.BatchNorm3d(nf + i * ng, eps=1e-3, momentum=1e-3))
-            dense_block_l.append(nn.ReLU())
-            dense_block_l.append(
-                nn.Conv3d(nf + i * ng, nf + i * ng, (1, 1, 1), stride=(1, 1, 1), padding=(0, 0, 0),
-                          bias=True))
-
-            dense_block_l.append(nn.BatchNorm3d(nf + i * ng, eps=1e-3, momentum=1e-3))
-            dense_block_l.append(nn.ReLU())
-            dense_block_l.append(
-                nn.Conv3d(nf + i * ng, ng, (3, 3, 3), stride=(1, 1, 1), padding=pad, bias=True))
-
-        self.dense_blocks = nn.ModuleList(dense_block_l)
-
-    def forward(self, x):
-        '''x: [B, C, T, H, W]
-        C: 1) 64 -> 208;
-        T: 1) 7 -> 7; (t_reduce=True)'''
-        for i in range(0, len(self.dense_blocks), 6):
-            y = x
-            for j in range(6):
-                y = self.dense_blocks[i + j](y)
-            x = torch.cat((x, y), 1)
-        return x
-
-
-class DUF_28L(nn.Module):
-    '''Official DUF structure with 28 layers'''
-
-    def __init__(self, scale=4, adapt_official=False):
-        super(DUF_28L, self).__init__()
-        self.conv3d_1 = nn.Conv3d(3, 64, (1, 3, 3), stride=(1, 1, 1), padding=(0, 1, 1), bias=True)
-        self.dense_block_1 = DenseBlock_28L(64, 16)  # 64 + 16 * 9 = 208, T = 7
-        self.dense_block_2 = DenseBlock(208, 16, t_reduce=True)  # 208 + 16 * 3 = 256, T = 1
-        self.bn3d_2 = nn.BatchNorm3d(256, eps=1e-3, momentum=1e-3)
-        self.conv3d_2 = nn.Conv3d(256, 256, (1, 3, 3), stride=(1, 1, 1), padding=(0, 1, 1),
-                                  bias=True)
-
-        self.conv3d_r1 = nn.Conv3d(256, 256, (1, 1, 1), stride=(1, 1, 1), padding=(0, 0, 0),
-                                   bias=True)
-        self.conv3d_r2 = nn.Conv3d(256, 3 * (scale**2), (1, 1, 1), stride=(1, 1, 1),
-                                   padding=(0, 0, 0), bias=True)
-
-        self.conv3d_f1 = nn.Conv3d(256, 512, (1, 1, 1), stride=(1, 1, 1), padding=(0, 0, 0),
-                                   bias=True)
-        self.conv3d_f2 = nn.Conv3d(512, 1 * 5 * 5 * (scale**2), (1, 1, 1), stride=(1, 1, 1),
-                                   padding=(0, 0, 0), bias=True)
-
-        self.dynamic_filter = DynamicUpsamplingFilter_3C((1, 5, 5))
-
-        self.scale = scale
-        self.adapt_official = adapt_official
-
-    def forward(self, x):
-        '''
-        x: [B, T, C, H, W], T = 7. reshape to [B, C, T, H, W] for Conv3D
-        Generate filters and image residual:
-        Fx: [B, 25, 16, H, W] for DynamicUpsamplingFilter_3C
-        Rx: [B, 3*16, 1, H, W]
-        '''
-        B, T, C, H, W = x.size()
-        x = x.permute(0, 2, 1, 3, 4)  # [B,C,T,H,W] for Conv3D
-        x_center = x[:, :, T // 2, :, :]
-        x = self.conv3d_1(x)
-        x = self.dense_block_1(x)
-        x = self.dense_block_2(x)  # reduce T to 1
-        x = F.relu(self.conv3d_2(F.relu(self.bn3d_2(x), inplace=True)), inplace=True)
-
-        # image residual
-        Rx = self.conv3d_r2(F.relu(self.conv3d_r1(x), inplace=True))  # [B, 3*16, 1, H, W]
-
-        # filter
-        Fx = self.conv3d_f2(F.relu(self.conv3d_f1(x), inplace=True))  # [B, 25*16, 1, H, W]
-        Fx = F.softmax(Fx.view(B, 25, self.scale**2, H, W), dim=1)
-
-        # Adapt to official model weights
-        if self.adapt_official:
-            adapt_official(Rx, scale=self.scale)
-
-        # dynamic filter
-        out = self.dynamic_filter(x_center, Fx)  # [B, 3*R, H, W]
-        out += Rx.squeeze_(2)
-        out = F.pixel_shuffle(out, self.scale)  # [B, 3, H, W]
-        return out
-
-
-class DenseBlock_52L(nn.Module):
-    '''The first part of the dense blocks used in DUF_52L
-    Temporal dimension remains the same here'''
-
-    def __init__(self, nf=64, ng=16):
-        super(DenseBlock_52L, self).__init__()
-        pad = (1, 1, 1)
-
-        dense_block_l = []
-        for i in range(0, 21):
-            dense_block_l.append(nn.BatchNorm3d(nf + i * ng, eps=1e-3, momentum=1e-3))
-            dense_block_l.append(nn.ReLU())
-            dense_block_l.append(
-                nn.Conv3d(nf + i * ng, nf + i * ng, (1, 1, 1), stride=(1, 1, 1), padding=(0, 0, 0),
-                          bias=True))
-
-            dense_block_l.append(nn.BatchNorm3d(nf + i * ng, eps=1e-3, momentum=1e-3))
-            dense_block_l.append(nn.ReLU())
-            dense_block_l.append(
-                nn.Conv3d(nf + i * ng, ng, (3, 3, 3), stride=(1, 1, 1), padding=pad, bias=True))
-
-        self.dense_blocks = nn.ModuleList(dense_block_l)
-
-    def forward(self, x):
-        '''x: [B, C, T, H, W]
-        C: 1) 64 -> 400;
-        T: 1) 7 -> 7; (t_reduce=True)'''
-        for i in range(0, len(self.dense_blocks), 6):
-            y = x
-            for j in range(6):
-                y = self.dense_blocks[i + j](y)
-            x = torch.cat((x, y), 1)
-        return x
-
-
-class DUF_52L(nn.Module):
-    '''Official DUF structure with 52 layers'''
-
-    def __init__(self, scale=4, adapt_official=False):
-        super(DUF_52L, self).__init__()
-        self.conv3d_1 = nn.Conv3d(3, 64, (1, 3, 3), stride=(1, 1, 1), padding=(0, 1, 1), bias=True)
-        self.dense_block_1 = DenseBlock_52L(64, 16)  # 64 + 21 * 9 = 400, T = 7
-        self.dense_block_2 = DenseBlock(400, 16, t_reduce=True)  # 400 + 16 * 3 = 448, T = 1
-
-        self.bn3d_2 = nn.BatchNorm3d(448, eps=1e-3, momentum=1e-3)
-        self.conv3d_2 = nn.Conv3d(448, 256, (1, 3, 3), stride=(1, 1, 1), padding=(0, 1, 1),
-                                  bias=True)
-
-        self.conv3d_r1 = nn.Conv3d(256, 256, (1, 1, 1), stride=(1, 1, 1), padding=(0, 0, 0),
-                                   bias=True)
-        self.conv3d_r2 = nn.Conv3d(256, 3 * (scale**2), (1, 1, 1), stride=(1, 1, 1),
-                                   padding=(0, 0, 0), bias=True)
-
-        self.conv3d_f1 = nn.Conv3d(256, 512, (1, 1, 1), stride=(1, 1, 1), padding=(0, 0, 0),
-                                   bias=True)
-        self.conv3d_f2 = nn.Conv3d(512, 1 * 5 * 5 * (scale**2), (1, 1, 1), stride=(1, 1, 1),
-                                   padding=(0, 0, 0), bias=True)
-
-        self.dynamic_filter = DynamicUpsamplingFilter_3C((1, 5, 5))
-
-        self.scale = scale
-        self.adapt_official = adapt_official
-
-    def forward(self, x):
-        '''
-        x: [B, T, C, H, W], T = 7. reshape to [B, C, T, H, W] for Conv3D
-        Generate filters and image residual:
-        Fx: [B, 25, 16, H, W] for DynamicUpsamplingFilter_3C
-        Rx: [B, 3*16, 1, H, W]
-        '''
-        B, T, C, H, W = x.size()
-        x = x.permute(0, 2, 1, 3, 4)  # [B,C,T,H,W] for Conv3D
-        x_center = x[:, :, T // 2, :, :]
-        x = self.conv3d_1(x)
-        x = self.dense_block_1(x)
-        x = self.dense_block_2(x)
-        x = F.relu(self.conv3d_2(F.relu(self.bn3d_2(x), inplace=True)), inplace=True)
-
-        # image residual
-        Rx = self.conv3d_r2(F.relu(self.conv3d_r1(x), inplace=True))  # [B, 3*16, 1, H, W]
-
-        # filter
-        Fx = self.conv3d_f2(F.relu(self.conv3d_f1(x), inplace=True))  # [B, 25*16, 1, H, W]
-        Fx = F.softmax(Fx.view(B, 25, self.scale**2, H, W), dim=1)
-
-        # Adapt to official model weights
-        if self.adapt_official:
-            adapt_official(Rx, scale=self.scale)
-
-        # dynamic filter
-        out = self.dynamic_filter(x_center, Fx)  # [B, 3*R, H, W]
-        out += Rx.squeeze_(2)
-        out = F.pixel_shuffle(out, self.scale)  # [B, 3, H, W]
         return out

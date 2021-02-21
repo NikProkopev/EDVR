@@ -1,170 +1,207 @@
-import logging
-from collections import OrderedDict
-
+import importlib
 import torch
-import torch.nn as nn
-from torch.nn.parallel import DataParallel, DistributedDataParallel
-import models.networks as networks
-import models.lr_scheduler as lr_scheduler
-from .base_model import BaseModel
-from models.loss import CharbonnierLoss
+from collections import OrderedDict
+from copy import deepcopy
+from os import path as osp
+from tqdm import tqdm
 
-logger = logging.getLogger('base')
+from basicsr.models.archs import define_network
+from basicsr.models.base_model import BaseModel
+from basicsr.utils import get_root_logger, imwrite, tensor2img
+
+loss_module = importlib.import_module('basicsr.models.losses')
+metric_module = importlib.import_module('basicsr.metrics')
 
 
 class SRModel(BaseModel):
+    """Base SR model for single image super-resolution."""
+
     def __init__(self, opt):
         super(SRModel, self).__init__(opt)
 
-        if opt['dist']:
-            self.rank = torch.distributed.get_rank()
-        else:
-            self.rank = -1  # non dist training
-        train_opt = opt['train']
+        # define network
+        self.net_g = define_network(deepcopy(opt['network_g']))
+        self.net_g = self.model_to_device(self.net_g)
+        self.print_network(self.net_g)
 
-        # define network and load pretrained models
-        self.netG = networks.define_G(opt).to(self.device)
-        if opt['dist']:
-            self.netG = DistributedDataParallel(self.netG, device_ids=[torch.cuda.current_device()])
-        else:
-            self.netG = DataParallel(self.netG)
-        # print network
-        self.print_network()
-        self.load()
+        # load pretrained models
+        load_path = self.opt['path'].get('pretrain_network_g', None)
+        if load_path is not None:
+            self.load_network(self.net_g, load_path,
+                              self.opt['path'].get('strict_load_g', True))
 
         if self.is_train:
-            self.netG.train()
+            self.init_training_settings()
 
-            # loss
-            loss_type = train_opt['pixel_criterion']
-            if loss_type == 'l1':
-                self.cri_pix = nn.L1Loss().to(self.device)
-            elif loss_type == 'l2':
-                self.cri_pix = nn.MSELoss().to(self.device)
-            elif loss_type == 'cb':
-                self.cri_pix = CharbonnierLoss().to(self.device)
+    def init_training_settings(self):
+        self.net_g.train()
+        train_opt = self.opt['train']
+
+        # define losses
+        if train_opt.get('pixel_opt'):
+            pixel_type = train_opt['pixel_opt'].pop('type')
+            cri_pix_cls = getattr(loss_module, pixel_type)
+            self.cri_pix = cri_pix_cls(**train_opt['pixel_opt']).to(
+                self.device)
+        else:
+            self.cri_pix = None
+
+        if train_opt.get('perceptual_opt'):
+            percep_type = train_opt['perceptual_opt'].pop('type')
+            cri_perceptual_cls = getattr(loss_module, percep_type)
+            self.cri_perceptual = cri_perceptual_cls(
+                **train_opt['perceptual_opt']).to(self.device)
+        else:
+            self.cri_perceptual = None
+
+        if self.cri_pix is None and self.cri_perceptual is None:
+            raise ValueError('Both pixel and perceptual losses are None.')
+
+        # set up optimizers and schedulers
+        self.setup_optimizers()
+        self.setup_schedulers()
+
+    def setup_optimizers(self):
+        train_opt = self.opt['train']
+        optim_params = []
+        for k, v in self.net_g.named_parameters():
+            if v.requires_grad:
+                optim_params.append(v)
             else:
-                raise NotImplementedError('Loss type [{:s}] is not recognized.'.format(loss_type))
-            self.l_pix_w = train_opt['pixel_weight']
+                logger = get_root_logger()
+                logger.warning(f'Params {k} will not be optimized.')
 
-            # optimizers
-            wd_G = train_opt['weight_decay_G'] if train_opt['weight_decay_G'] else 0
-            optim_params = []
-            for k, v in self.netG.named_parameters():  # can optimize for a part of the model
-                if v.requires_grad:
-                    optim_params.append(v)
-                else:
-                    if self.rank <= 0:
-                        logger.warning('Params [{:s}] will not optimize.'.format(k))
-            self.optimizer_G = torch.optim.Adam(optim_params, lr=train_opt['lr_G'],
-                                                weight_decay=wd_G,
-                                                betas=(train_opt['beta1'], train_opt['beta2']))
-            self.optimizers.append(self.optimizer_G)
+        optim_type = train_opt['optim_g'].pop('type')
+        if optim_type == 'Adam':
+            self.optimizer_g = torch.optim.Adam(optim_params,
+                                                **train_opt['optim_g'])
+        else:
+            raise NotImplementedError(
+                f'optimizer {optim_type} is not supperted yet.')
+        self.optimizers.append(self.optimizer_g)
 
-            # schedulers
-            if train_opt['lr_scheme'] == 'MultiStepLR':
-                for optimizer in self.optimizers:
-                    self.schedulers.append(
-                        lr_scheduler.MultiStepLR_Restart(optimizer, train_opt['lr_steps'],
-                                                         restarts=train_opt['restarts'],
-                                                         weights=train_opt['restart_weights'],
-                                                         gamma=train_opt['lr_gamma'],
-                                                         clear_state=train_opt['clear_state']))
-            elif train_opt['lr_scheme'] == 'CosineAnnealingLR_Restart':
-                for optimizer in self.optimizers:
-                    self.schedulers.append(
-                        lr_scheduler.CosineAnnealingLR_Restart(
-                            optimizer, train_opt['T_period'], eta_min=train_opt['eta_min'],
-                            restarts=train_opt['restarts'], weights=train_opt['restart_weights']))
-            else:
-                raise NotImplementedError('MultiStepLR learning rate scheme is enough.')
+    def feed_data(self, data):
+        self.lq = data['lq'].to(self.device)
+        if 'gt' in data:
+            self.gt = data['gt'].to(self.device)
 
-            self.log_dict = OrderedDict()
+    def optimize_parameters(self, current_iter):
+        self.optimizer_g.zero_grad()
+        self.output = self.net_g(self.lq)
 
-    def feed_data(self, data, need_GT=True):
-        self.var_L = data['LQ'].to(self.device)  # LQ
-        if need_GT:
-            self.real_H = data['GT'].to(self.device)  # GT
+        l_total = 0
+        loss_dict = OrderedDict()
+        # pixel loss
+        if self.cri_pix:
+            l_pix = self.cri_pix(self.output, self.gt)
+            l_total += l_pix
+            loss_dict['l_pix'] = l_pix
+        # perceptual loss
+        if self.cri_perceptual:
+            l_percep, l_style = self.cri_perceptual(self.output, self.gt)
+            if l_percep is not None:
+                l_total += l_percep
+                loss_dict['l_percep'] = l_percep
+            if l_style is not None:
+                l_total += l_style
+                loss_dict['l_style'] = l_style
 
-    def optimize_parameters(self, step):
-        self.optimizer_G.zero_grad()
-        self.fake_H = self.netG(self.var_L)
-        l_pix = self.l_pix_w * self.cri_pix(self.fake_H, self.real_H)
-        l_pix.backward()
-        self.optimizer_G.step()
+        l_total.backward()
+        self.optimizer_g.step()
 
-        # set log
-        self.log_dict['l_pix'] = l_pix.item()
+        self.log_dict = self.reduce_loss_dict(loss_dict)
 
     def test(self):
-        self.netG.eval()
+        self.net_g.eval()
         with torch.no_grad():
-            self.fake_H = self.netG(self.var_L)
-        self.netG.train()
+            self.output = self.net_g(self.lq)
+        self.net_g.train()
 
-    def test_x8(self):
-        # from https://github.com/thstkdgus35/EDSR-PyTorch
-        self.netG.eval()
+    def dist_validation(self, dataloader, current_iter, tb_logger, save_img):
+        logger = get_root_logger()
+        logger.info('Only support single GPU validation.')
+        self.nondist_validation(dataloader, current_iter, tb_logger, save_img)
 
-        def _transform(v, op):
-            # if self.precision != 'single': v = v.float()
-            v2np = v.data.cpu().numpy()
-            if op == 'v':
-                tfnp = v2np[:, :, :, ::-1].copy()
-            elif op == 'h':
-                tfnp = v2np[:, :, ::-1, :].copy()
-            elif op == 't':
-                tfnp = v2np.transpose((0, 1, 3, 2)).copy()
+    def nondist_validation(self, dataloader, current_iter, tb_logger,
+                           save_img):
+        dataset_name = dataloader.dataset.opt['name']
+        with_metrics = self.opt['val'].get('metrics') is not None
+        if with_metrics:
+            self.metric_results = {
+                metric: 0
+                for metric in self.opt['val']['metrics'].keys()
+            }
+        pbar = tqdm(total=len(dataloader), unit='image')
 
-            ret = torch.Tensor(tfnp).to(self.device)
-            # if self.precision == 'half': ret = ret.half()
+        for idx, val_data in enumerate(dataloader):
+            img_name = osp.splitext(osp.basename(val_data['lq_path'][0]))[0]
+            self.feed_data(val_data)
+            self.test()
 
-            return ret
+            visuals = self.get_current_visuals()
+            sr_img = tensor2img([visuals['result']])
+            if 'gt' in visuals:
+                gt_img = tensor2img([visuals['gt']])
+                del self.gt
 
-        lr_list = [self.var_L]
-        for tf in 'v', 'h', 't':
-            lr_list.extend([_transform(t, tf) for t in lr_list])
-        with torch.no_grad():
-            sr_list = [self.netG(aug) for aug in lr_list]
-        for i in range(len(sr_list)):
-            if i > 3:
-                sr_list[i] = _transform(sr_list[i], 't')
-            if i % 4 > 1:
-                sr_list[i] = _transform(sr_list[i], 'h')
-            if (i % 4) % 2 == 1:
-                sr_list[i] = _transform(sr_list[i], 'v')
+            # tentative for out of GPU memory
+            del self.lq
+            del self.output
+            torch.cuda.empty_cache()
 
-        output_cat = torch.cat(sr_list, dim=0)
-        self.fake_H = output_cat.mean(dim=0, keepdim=True)
-        self.netG.train()
+            if save_img:
+                if self.opt['is_train']:
+                    save_img_path = osp.join(self.opt['path']['visualization'],
+                                             img_name,
+                                             f'{img_name}_{current_iter}.png')
+                else:
+                    if self.opt['val']['suffix']:
+                        save_img_path = osp.join(
+                            self.opt['path']['visualization'], dataset_name,
+                            f'{img_name}_{self.opt["val"]["suffix"]}.png')
+                    else:
+                        save_img_path = osp.join(
+                            self.opt['path']['visualization'], dataset_name,
+                            f'{img_name}_{self.opt["name"]}.png')
+                imwrite(sr_img, save_img_path)
 
-    def get_current_log(self):
-        return self.log_dict
+            if with_metrics:
+                # calculate metrics
+                opt_metric = deepcopy(self.opt['val']['metrics'])
+                for name, opt_ in opt_metric.items():
+                    metric_type = opt_.pop('type')
+                    self.metric_results[name] += getattr(
+                        metric_module, metric_type)(sr_img, gt_img, **opt_)
+            pbar.update(1)
+            pbar.set_description(f'Test {img_name}')
+        pbar.close()
 
-    def get_current_visuals(self, need_GT=True):
+        if with_metrics:
+            for metric in self.metric_results.keys():
+                self.metric_results[metric] /= (idx + 1)
+
+            self._log_validation_metric_values(current_iter, dataset_name,
+                                               tb_logger)
+
+    def _log_validation_metric_values(self, current_iter, dataset_name,
+                                      tb_logger):
+        log_str = f'Validation {dataset_name}\n'
+        for metric, value in self.metric_results.items():
+            log_str += f'\t # {metric}: {value:.4f}\n'
+        logger = get_root_logger()
+        logger.info(log_str)
+        if tb_logger:
+            for metric, value in self.metric_results.items():
+                tb_logger.add_scalar(f'metrics/{metric}', value, current_iter)
+
+    def get_current_visuals(self):
         out_dict = OrderedDict()
-        out_dict['LQ'] = self.var_L.detach()[0].float().cpu()
-        out_dict['rlt'] = self.fake_H.detach()[0].float().cpu()
-        if need_GT:
-            out_dict['GT'] = self.real_H.detach()[0].float().cpu()
+        out_dict['lq'] = self.lq.detach().cpu()
+        out_dict['result'] = self.output.detach().cpu()
+        if hasattr(self, 'gt'):
+            out_dict['gt'] = self.gt.detach().cpu()
         return out_dict
 
-    def print_network(self):
-        s, n = self.get_network_description(self.netG)
-        if isinstance(self.netG, nn.DataParallel) or isinstance(self.netG, DistributedDataParallel):
-            net_struc_str = '{} - {}'.format(self.netG.__class__.__name__,
-                                             self.netG.module.__class__.__name__)
-        else:
-            net_struc_str = '{}'.format(self.netG.__class__.__name__)
-        if self.rank <= 0:
-            logger.info('Network G structure: {}, with parameters: {:,d}'.format(net_struc_str, n))
-            logger.info(s)
-
-    def load(self):
-        load_path_G = self.opt['path']['pretrain_model_G']
-        if load_path_G is not None:
-            logger.info('Loading model for G [{:s}] ...'.format(load_path_G))
-            self.load_network(load_path_G, self.netG, self.opt['path']['strict_load'])
-
-    def save(self, iter_label):
-        self.save_network(self.netG, 'G', iter_label)
+    def save(self, epoch, current_iter):
+        self.save_network(self.net_g, 'net_g', current_iter)
+        self.save_training_state(epoch, current_iter)
